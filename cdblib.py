@@ -1,13 +1,9 @@
-#!/usr/bin/env python2.5
-
 '''
 Manipulate DJB's Constant Databases. These are 2 level disk-based hash tables
 that efficiently handle many keys, while remaining space-efficient.
 
     http://cr.yp.to/cdb.html
 
-When generated databases are only used with Python code, consider using hash()
-rather than djb_hash() for a tidy speedup.
 '''
 
 from _struct import Struct
@@ -27,12 +23,17 @@ except ImportError:
     djb_hash = py_djb_hash
 
 read_2_le4 = Struct('<LL').unpack
+read_2_le8 = Struct('<QQ').unpack
 write_2_le4 = Struct('<LL').pack
+write_2_le8 = Struct('<QQ').pack
 
 
 class Reader(object):
     '''A dictionary-like object for reading a Constant Database accessed
     through a string or string-like sequence, such as mmap.mmap().'''
+
+    read_pair = staticmethod(read_2_le4)
+    pair_size = 8
 
     def __init__(self, data, hashfn=djb_hash):
         '''Create an instance reading from a sequence and using hashfn to hash
@@ -42,18 +43,18 @@ class Reader(object):
 
         self.data = data
         self.hashfn = hashfn
-
-        self.index = [read_2_le4(data[i:i+8]) for i in xrange(0, 2048, 8)]
+        self.index = [self.read_pair(data[i:i+self.pair_size])
+                      for i in xrange(0, 256*self.pair_size, self.pair_size)]
         self.table_start = min(p[0] for p in self.index)
         # Assume load load factor is 0.5 like official CDB.
         self.length = sum(p[1] >> 1 for p in self.index)
 
     def iteritems(self):
         '''Like dict.iteritems(). Items are returned in insertion order.'''
-        pos = 2048
+        pos = self.pair_size * 256
         while pos < self.table_start:
-            klen, dlen = read_2_le4(self.data[pos:pos+8])
-            pos += 8
+            klen, dlen = self.read_pair(self.data[pos:pos+self.pair_size])
+            pos += self.pair_size
 
             key = self.data[pos:pos+klen]
             pos += klen
@@ -107,18 +108,22 @@ class Reader(object):
         start, nslots = self.index[h & 0xff]
 
         if nslots:
-            end = start + (nslots << 3)
-            slot_off = start + (((h >> 8) % nslots) << 3)
+            end = start + (nslots * self.pair_size)
+            slot_off = start + (((h >> 8) % nslots) * self.pair_size)
 
-            for pos in chain(xrange(slot_off, end, 8),
-                             xrange(start, slot_off, 8)):
-                rec_h, rec_pos = read_2_le4(self.data[pos:pos+8])
+            for pos in chain(xrange(slot_off, end, self.pair_size),
+                             xrange(start, slot_off, self.pair_size)):
+                rec_h, rec_pos = self.read_pair(
+                    self.data[pos:pos+self.pair_size]
+                )
 
                 if not rec_h:
                     break
                 elif rec_h == h:
-                    klen, dlen = read_2_le4(self.data[rec_pos:rec_pos+8])
-                    rec_pos += 8
+                    klen, dlen = self.read_pair(
+                        self.data[rec_pos:rec_pos+self.pair_size]
+                    )
+                    rec_pos += self.pair_size
 
                     if self.data[rec_pos:rec_pos+klen] == key:
                         rec_pos += klen
@@ -155,9 +160,21 @@ class Reader(object):
         return (v.decode(encoding) for v in self.gets(key))
 
 
+class Reader64(Reader):
+    '''A cdblib.Reader variant to support reading from CDB files that use
+    64-bit file offsets. The CDB file must be generated with an appropriate
+    writer.'''
+
+    read_pair = staticmethod(read_2_le8)
+    pair_size = 16
+
+
 class Writer(object):
     '''Object for building new Constant Databases, and writing them to a
     seekable file-like object.'''
+
+    write_pair = staticmethod(write_2_le4)
+    pair_size = 8
 
     def __init__(self, fp, hashfn=djb_hash):
         '''Create an instance writing to a file-like object, using hashfn to
@@ -165,7 +182,7 @@ class Writer(object):
         self.fp = fp
         self.hashfn = hashfn
 
-        fp.write('\x00' * 2048)
+        fp.write('\x00' * (256 * self.pair_size))
         self._unordered = [[] for i in xrange(256)]
 
     def put(self, key, value=''):
@@ -173,7 +190,7 @@ class Writer(object):
         assert type(key) is str and type(value) is str
 
         pos = self.fp.tell()
-        self.fp.write(write_2_le4(len(key), len(value)))
+        self.fp.write(self.write_pair(len(key), len(value)))
         self.fp.write(key)
         self.fp.write(value)
 
@@ -211,7 +228,7 @@ class Writer(object):
         index. The output file remains open upon return.'''
         index = []
         for tbl in self._unordered:
-            length = len(tbl) << 1
+            length = len(tbl) * 2
             ordered = [(0, 0)] * length
             for pair in tbl:
                 where = (pair[0] >> 8) % length
@@ -222,9 +239,17 @@ class Writer(object):
 
             index.append((self.fp.tell(), length))
             for pair in ordered:
-                self.fp.write(write_2_le4(*pair))
+                self.fp.write(self.write_pair(*pair))
 
         self.fp.seek(0)
         for pair in index:
-            self.fp.write(write_2_le4(*pair))
+            self.fp.write(self.write_pair(*pair))
         self.fp = None # prevent double finalize()
+
+
+class Writer64(Writer):
+    '''A cdblib.Writer variant to support writing CDB files that use 64-bit
+    file offsets.'''
+
+    write_pair = staticmethod(write_2_le8)
+    pair_size = 16
