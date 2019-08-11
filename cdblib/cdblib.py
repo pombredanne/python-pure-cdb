@@ -5,49 +5,84 @@ that efficiently handle many keys, while remaining space-efficient.
     http://cr.yp.to/cdb.html
 
 '''
-
-from _struct import Struct
+from struct import Struct
 from itertools import chain
 
+from .djb_hash import djb_hash
 
-def py_djb_hash(s):
-    '''Return the value of DJB's hash function for the given 8-bit string.'''
-    h = 5381
-    for c in s:
-        h = (((h << 5) + h) ^ ord(c)) & 0xffffffff
-    return h
-
-try:
-    from _cdblib import djb_hash
-except ImportError:
-    djb_hash = py_djb_hash
-
+# Structs for 32-bit databases
 read_2_le4 = Struct('<LL').unpack
-read_2_le8 = Struct('<QQ').unpack
 write_2_le4 = Struct('<LL').pack
+
+# Structs for 64-bit databases
+read_2_le8 = Struct('<QQ').unpack
 write_2_le8 = Struct('<QQ').pack
 
+# Encoders for keys
+DEFAULT_ENCODERS = {
+    str: lambda x: x.encode('utf-8'),
+    int: lambda x: str(x).encode('utf-8'),
+}
 
-class Reader(object):
+
+class _CDBBase(object):
+    def __init__(self, hashfn=djb_hash, strict=False, encoders=None):
+        self.hashfn = hashfn
+
+        if strict:
+            self.hash_key = self.hash_key_strict
+
+        self.encoders = DEFAULT_ENCODERS.copy()
+        if encoders is not None:
+            self.encoders.update(encoders)
+
+    def hash_key(self, key):
+        if not isinstance(key, bytes):
+            try:
+                encoded_key = self.encoders[type(key)](key)
+            except KeyError as e:
+                e.args = 'could not encode {} to bytes'.format(key)
+                raise
+        else:
+            encoded_key = key
+
+        # Truncate to 32 bits and remove sign.
+        h = self.hashfn(encoded_key)
+        return encoded_key, (h & 0xffffffff)
+
+    def hash_key_strict(self, key):
+        try:
+            h = self.hashfn(key)
+        except TypeError as e:
+            msg = 'key must be of type bytes'
+            e.args = (msg,)
+            raise
+
+        # Truncate to 32 bits and remove sign.
+        return key, (h & 0xffffffff)
+
+
+class Reader(_CDBBase):
     '''A dictionary-like object for reading a Constant Database accessed
     through a string or string-like sequence, such as mmap.mmap().'''
 
     read_pair = staticmethod(read_2_le4)
     pair_size = 8
 
-    def __init__(self, data, hashfn=djb_hash):
+    def __init__(self, data, **kwargs):
         '''Create an instance reading from a sequence and using hashfn to hash
         keys.'''
-        if len(data) < 2048:
+        if len(data) < (self.pair_size * 256):
             raise IOError('CDB too small')
 
         self.data = data
-        self.hashfn = hashfn
         self.index = [self.read_pair(data[i:i+self.pair_size])
-                      for i in xrange(0, 256*self.pair_size, self.pair_size)]
+                      for i in range(0, 256*self.pair_size, self.pair_size)]
         self.table_start = min(p[0] for p in self.index)
         # Assume load load factor is 0.5 like official CDB.
         self.length = sum(p[1] >> 1 for p in self.index)
+
+        super(Reader, self).__init__(**kwargs)
 
     def iteritems(self):
         '''Like dict.iteritems(). Items are returned in insertion order.'''
@@ -103,16 +138,15 @@ class Reader(object):
 
     def gets(self, key):
         '''Yield values for key in insertion order.'''
-        # Truncate to 32 bits and remove sign.
-        h = self.hashfn(key) & 0xffffffff
+        key, h = self.hash_key(key)
         start, nslots = self.index[h & 0xff]
 
         if nslots:
             end = start + (nslots * self.pair_size)
             slot_off = start + (((h >> 8) % nslots) * self.pair_size)
 
-            for pos in chain(xrange(slot_off, end, self.pair_size),
-                             xrange(start, slot_off, self.pair_size)):
+            for pos in chain(range(slot_off, end, self.pair_size),
+                             range(start, slot_off, self.pair_size)):
                 rec_h, rec_pos = self.read_pair(
                     self.data[pos:pos+self.pair_size]
                 )
@@ -132,7 +166,7 @@ class Reader(object):
     def get(self, key, default=None):
         '''Get the first value for key, returning default if missing.'''
         # Avoid exception catch when handling default case; much faster.
-        return chain(self.gets(key), (default,)).next()
+        return next(chain(self.gets(key), (default,)))
 
     def getint(self, key, default=None, base=0):
         '''Get the first value for key converted it to an int, returning
@@ -169,32 +203,42 @@ class Reader64(Reader):
     pair_size = 16
 
 
-class Writer(object):
+class Writer(_CDBBase):
     '''Object for building new Constant Databases, and writing them to a
     seekable file-like object.'''
 
     write_pair = staticmethod(write_2_le4)
     pair_size = 8
 
-    def __init__(self, fp, hashfn=djb_hash):
+    def __init__(self, fp, **kwargs):
         '''Create an instance writing to a file-like object, using hashfn to
         hash keys.'''
         self.fp = fp
-        self.hashfn = hashfn
+        fp.write(b'\x00' * (256 * self.pair_size))
+        self._unordered = [[] for i in range(256)]
 
-        fp.write('\x00' * (256 * self.pair_size))
-        self._unordered = [[] for i in xrange(256)]
+        super(Writer, self).__init__(**kwargs)
 
-    def put(self, key, value=''):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.finalize()
+
+    def put(self, key, value=b''):
         '''Write a string key/value pair to the output file.'''
-        assert type(key) is str and type(value) is str
+        # Ensure that the value is binary
+        if not isinstance(value, bytes):
+            raise TypeError('value must be of type bytes')
+
+        # Computing the hash for the key also ensures that it's binary
+        key, h = self.hash_key(key)
 
         pos = self.fp.tell()
         self.fp.write(self.write_pair(len(key), len(value)))
         self.fp.write(key)
         self.fp.write(value)
 
-        h = self.hashfn(key) & 0xffffffff
         self._unordered[h & 0xff].append((h, pos))
 
     def puts(self, key, values):
@@ -206,22 +250,22 @@ class Writer(object):
     def putint(self, key, value):
         '''Write an integer as a base-10 string associated with the given key
         to the output file.'''
-        self.put(key, str(value))
+        self.put(key, str(int(value)).encode('ascii'))
 
     def putints(self, key, values):
         '''Write zero or more integers for the same key to the output file.
         Equivalent to calling putint() in a loop.'''
-        self.puts(key, (str(value) for value in values))
+        self.puts(key, (str(int(value)).encode('ascii') for value in values))
 
     def putstring(self, key, value, encoding='utf-8'):
         '''Write a unicode string associated with the given key to the output
         file after encoding it as UTF-8 or the given encoding.'''
-        self.put(key, unicode.encode(value, encoding))
+        self.put(key, value.encode(encoding))
 
     def putstrings(self, key, values, encoding='utf-8'):
         '''Write zero or more unicode strings to the output file. Equivalent to
         calling putstring() in a loop.'''
-        self.puts(key, (unicode.encode(value, encoding) for value in values))
+        self.puts(key, (v.encode(encoding) for v in values))
 
     def finalize(self):
         '''Write the final hash tables to the output file, and write out its
@@ -232,7 +276,7 @@ class Writer(object):
             ordered = [(0, 0)] * length
             for pair in tbl:
                 where = (pair[0] >> 8) % length
-                for i in chain(xrange(where, length), xrange(0, where)):
+                for i in chain(range(where, length), range(0, where)):
                     if not ordered[i][0]:
                         ordered[i] = pair
                         break
@@ -244,7 +288,7 @@ class Writer(object):
         self.fp.seek(0)
         for pair in index:
             self.fp.write(self.write_pair(*pair))
-        self.fp = None # prevent double finalize()
+        self.fp = None  # prevent double finalize()
 
 
 class Writer64(Writer):
